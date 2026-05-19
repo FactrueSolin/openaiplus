@@ -221,7 +221,7 @@ impl ChatGptCheckoutClient {
                     error!(
                         proxy = %sanitize_proxy_url(&proxy_client.url),
                         status = %err.status,
-                        error = %err.message,
+                        error = %terminal_checkout_error_for_log(&err),
                         "checkout proxy attempt returned terminal error"
                     );
                     return Err(err);
@@ -281,7 +281,8 @@ impl ChatGptCheckoutClient {
                 "ChatGPT checkout returned non-success status"
             );
             return Err(CheckoutAttemptError::Final(AppError::bad_gateway(format!(
-                "ChatGPT checkout returned HTTP {status}: {body}"
+                "ChatGPT checkout returned HTTP {status}; {}",
+                response_body_summary(&body)
             ))));
         }
 
@@ -293,7 +294,8 @@ impl ChatGptCheckoutClient {
                 "ChatGPT checkout response missing checkout url"
             );
             CheckoutAttemptError::Final(AppError::bad_gateway(format!(
-                "missing checkout url in response: {body}"
+                "missing checkout url in ChatGPT response; {}",
+                response_body_summary(&body)
             )))
         })?;
 
@@ -397,6 +399,23 @@ fn response_body_keys(body: &Value) -> Vec<&str> {
         Value::Object(map) => map.keys().map(String::as_str).collect(),
         _ => Vec::new(),
     }
+}
+
+fn response_body_summary(body: &Value) -> String {
+    let keys = response_body_keys(body);
+    if keys.is_empty() {
+        return format!("response_kind={}", response_body_kind(body));
+    }
+
+    format!(
+        "response_kind={}, response_keys={}",
+        response_body_kind(body),
+        keys.join(",")
+    )
+}
+
+fn terminal_checkout_error_for_log(_err: &AppError) -> &'static str {
+    "terminal checkout error"
 }
 
 struct AppConfig {
@@ -530,12 +549,36 @@ mod tests {
             "checkout_session_id": "cs_secret"
         });
         let keys = response_body_keys(&body);
+        let summary = response_body_summary(&body);
 
         assert_eq!(response_body_kind(&body), "object");
         assert!(keys.contains(&"error"));
         assert!(keys.contains(&"checkout_session_id"));
         assert!(!keys.contains(&"sensitive upstream details"));
         assert!(!keys.contains(&"cs_secret"));
+        assert!(summary.contains("error"));
+        assert!(summary.contains("checkout_session_id"));
+        assert!(!summary.contains("sensitive upstream details"));
+        assert!(!summary.contains("cs_secret"));
+    }
+
+    #[test]
+    fn final_app_error_proxy_log_excludes_error_message_body() {
+        let body = json!({
+            "error": "sensitive upstream details",
+            "checkout_session_id": "cs_secret"
+        });
+        let err = AppError::bad_gateway(format!(
+            "ChatGPT checkout returned HTTP 500 Internal Server Error; {}",
+            response_body_summary(&body)
+        ));
+        let logged_error = terminal_checkout_error_for_log(&err);
+
+        assert!(!err.message.contains("sensitive upstream details"));
+        assert!(!err.message.contains("cs_secret"));
+        assert!(!logged_error.contains(&err.message));
+        assert!(!logged_error.contains("sensitive upstream details"));
+        assert!(!logged_error.contains("cs_secret"));
     }
 
     #[test]
