@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use rand::prelude::IndexedRandom;
+use rand::Rng;
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -167,33 +167,79 @@ impl ChatGptCheckoutClient {
         &self,
         request: CheckoutRequest,
     ) -> Result<CheckoutResponse, AppError> {
-        let selected = self.select_client();
         let payload = chatgpt_checkout_payload();
+        let session_token = request.session_token.trim();
 
-        let response = selected
-            .client
+        if self.proxy_clients.is_empty() {
+            return self
+                .send_checkout_request(&self.direct_client, None, session_token, &payload)
+                .await
+                .map_err(checkout_attempt_error_into_app_error);
+        }
+
+        let start_index = rand::rng().random_range(0..self.proxy_clients.len());
+        let mut last_send_error = None;
+
+        for index in proxy_attempt_indices(self.proxy_clients.len(), start_index) {
+            let proxy_client = &self.proxy_clients[index];
+            match self
+                .send_checkout_request(
+                    &proxy_client.client,
+                    Some(proxy_client.url.clone()),
+                    session_token,
+                    &payload,
+                )
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(CheckoutAttemptError::Send(err)) => last_send_error = Some(err),
+                Err(CheckoutAttemptError::Final(err)) => return Err(err),
+            }
+        }
+
+        let message = match last_send_error {
+            Some(err) => format!(
+                "ChatGPT checkout request failed after {} proxy attempts: {err}",
+                self.proxy_clients.len()
+            ),
+            None => "ChatGPT checkout request failed: no proxy attempted".to_string(),
+        };
+
+        Err(AppError::bad_gateway(message))
+    }
+
+    async fn send_checkout_request(
+        &self,
+        client: &Client,
+        used_proxy: Option<String>,
+        session_token: &str,
+        payload: &Value,
+    ) -> Result<CheckoutResponse, CheckoutAttemptError> {
+        let response = client
             .post(CHATGPT_CHECKOUT_URL)
-            .bearer_auth(request.session_token.trim())
-            .json(&payload)
+            .bearer_auth(session_token)
+            .json(payload)
             .send()
             .await
-            .map_err(|err| {
-                AppError::bad_gateway(format!("ChatGPT checkout request failed: {err}"))
-            })?;
+            .map_err(CheckoutAttemptError::Send)?;
 
         let status = response.status();
         let body = response.json::<Value>().await.map_err(|err| {
-            AppError::bad_gateway(format!("invalid ChatGPT checkout response: {err}"))
+            CheckoutAttemptError::Final(AppError::bad_gateway(format!(
+                "invalid ChatGPT checkout response: {err}"
+            )))
         })?;
 
         if !status.is_success() {
-            return Err(AppError::bad_gateway(format!(
+            return Err(CheckoutAttemptError::Final(AppError::bad_gateway(format!(
                 "ChatGPT checkout returned HTTP {status}: {body}"
-            )));
+            ))));
         }
 
         let checkout_url = extract_checkout_url(&body).ok_or_else(|| {
-            AppError::bad_gateway(format!("missing checkout url in response: {body}"))
+            CheckoutAttemptError::Final(AppError::bad_gateway(format!(
+                "missing checkout url in response: {body}"
+            )))
         })?;
 
         Ok(CheckoutResponse {
@@ -206,30 +252,28 @@ impl ChatGptCheckoutClient {
                 .get("processor_entity")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            used_proxy: selected.proxy_url,
+            used_proxy,
             raw: body,
         })
     }
+}
 
-    fn select_client(&self) -> SelectedClient<'_> {
-        let mut rng = rand::rng();
-        if let Some(proxy_client) = self.proxy_clients.choose(&mut rng) {
-            return SelectedClient {
-                client: &proxy_client.client,
-                proxy_url: Some(proxy_client.url.clone()),
-            };
-        }
+enum CheckoutAttemptError {
+    Send(reqwest::Error),
+    Final(AppError),
+}
 
-        SelectedClient {
-            client: &self.direct_client,
-            proxy_url: None,
+fn checkout_attempt_error_into_app_error(err: CheckoutAttemptError) -> AppError {
+    match err {
+        CheckoutAttemptError::Send(err) => {
+            AppError::bad_gateway(format!("ChatGPT checkout request failed: {err}"))
         }
+        CheckoutAttemptError::Final(err) => err,
     }
 }
 
-struct SelectedClient<'a> {
-    client: &'a Client,
-    proxy_url: Option<String>,
+fn proxy_attempt_indices(proxy_count: usize, start_index: usize) -> impl Iterator<Item = usize> {
+    (0..proxy_count).map(move |offset| (start_index + offset) % proxy_count)
 }
 
 fn build_client(proxy: Option<Proxy>) -> Result<Client> {
@@ -380,5 +424,18 @@ mod tests {
                 "socks5h://127.0.0.1:1080".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn proxy_attempt_indices_try_each_proxy_once_from_random_start() {
+        assert_eq!(
+            proxy_attempt_indices(4, 2).collect::<Vec<_>>(),
+            vec![2, 3, 0, 1]
+        );
+        assert_eq!(
+            proxy_attempt_indices(3, 0).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(proxy_attempt_indices(0, 0).collect::<Vec<_>>().is_empty());
     }
 }
