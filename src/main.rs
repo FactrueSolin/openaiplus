@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use rand::Rng;
-use reqwest::{Client, Proxy};
+use reqwest::{Client, Proxy, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tower_http::services::ServeDir;
@@ -152,8 +152,9 @@ impl ChatGptCheckoutClient {
         let mut proxy_clients = Vec::with_capacity(proxy_pool.len());
 
         for proxy_url in proxy_pool {
-            let proxy = Proxy::all(&proxy_url)
-                .with_context(|| format!("invalid proxy url: {proxy_url}"))?;
+            let proxy = Proxy::all(&proxy_url).with_context(|| {
+                format!("invalid proxy url: {}", sanitize_proxy_url(&proxy_url))
+            })?;
             proxy_clients.push(ProxyClient {
                 url: proxy_url,
                 client: build_client(Some(proxy))?,
@@ -181,7 +182,16 @@ impl ChatGptCheckoutClient {
             return self
                 .send_checkout_request(&self.direct_client, None, session_token, &payload)
                 .await
-                .map_err(checkout_attempt_error_into_app_error);
+                .map_err(|err| {
+                    if let CheckoutAttemptError::Send(send_err) = &err {
+                        warn!(
+                            error = %send_err,
+                            "checkout direct attempt failed"
+                        );
+                    }
+
+                    checkout_attempt_error_into_app_error(err)
+                });
         }
 
         let start_index = rand::rng().random_range(0..self.proxy_clients.len());
@@ -201,7 +211,7 @@ impl ChatGptCheckoutClient {
                 Ok(response) => return Ok(response),
                 Err(CheckoutAttemptError::Send(err)) => {
                     warn!(
-                        proxy = %proxy_client.url,
+                        proxy = %sanitize_proxy_url(&proxy_client.url),
                         error = %err,
                         "checkout proxy attempt failed"
                     );
@@ -209,7 +219,7 @@ impl ChatGptCheckoutClient {
                 }
                 Err(CheckoutAttemptError::Final(err)) => {
                     error!(
-                        proxy = %proxy_client.url,
+                        proxy = %sanitize_proxy_url(&proxy_client.url),
                         status = %err.status,
                         error = %err.message,
                         "checkout proxy attempt returned terminal error"
@@ -237,7 +247,10 @@ impl ChatGptCheckoutClient {
         session_token: &str,
         payload: &Value,
     ) -> Result<CheckoutResponse, CheckoutAttemptError> {
-        let upstream = used_proxy.as_deref().unwrap_or("direct");
+        let upstream = used_proxy
+            .as_deref()
+            .map(sanitize_proxy_url)
+            .unwrap_or_else(|| "direct".to_string());
         let response = client
             .post(CHATGPT_CHECKOUT_URL)
             .bearer_auth(session_token)
@@ -249,7 +262,7 @@ impl ChatGptCheckoutClient {
         let status = response.status();
         let body = response.json::<Value>().await.map_err(|err| {
             error!(
-                upstream,
+                upstream = %upstream,
                 status = %status,
                 error = %err,
                 "failed to parse ChatGPT checkout response"
@@ -261,9 +274,10 @@ impl ChatGptCheckoutClient {
 
         if !status.is_success() {
             warn!(
-                upstream,
+                upstream = %upstream,
                 status = %status,
-                response = %body,
+                response_kind = response_body_kind(&body),
+                response_keys = ?response_body_keys(&body),
                 "ChatGPT checkout returned non-success status"
             );
             return Err(CheckoutAttemptError::Final(AppError::bad_gateway(format!(
@@ -273,8 +287,9 @@ impl ChatGptCheckoutClient {
 
         let checkout_url = extract_checkout_url(&body).ok_or_else(|| {
             error!(
-                upstream,
-                response = %body,
+                upstream = %upstream,
+                response_kind = response_body_kind(&body),
+                response_keys = ?response_body_keys(&body),
                 "ChatGPT checkout response missing checkout url"
             );
             CheckoutAttemptError::Final(AppError::bad_gateway(format!(
@@ -349,6 +364,39 @@ fn extract_checkout_url(body: &Value) -> Option<String> {
         .iter()
         .find_map(|key| body.get(key).and_then(Value::as_str))
         .map(str::to_owned)
+}
+
+fn sanitize_proxy_url(proxy_url: &str) -> String {
+    let Ok(mut url) = Url::parse(proxy_url) else {
+        return "<invalid proxy url>".to_string();
+    };
+
+    if !url.username().is_empty() {
+        let _ = url.set_username("redacted");
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some("redacted"));
+    }
+
+    url.to_string()
+}
+
+fn response_body_kind(body: &Value) -> &'static str {
+    match body {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn response_body_keys(body: &Value) -> Vec<&str> {
+    match body {
+        Value::Object(map) => map.keys().map(String::as_str).collect(),
+        _ => Vec::new(),
+    }
 }
 
 struct AppConfig {
@@ -464,6 +512,30 @@ mod tests {
                 "socks5h://127.0.0.1:1080".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn sanitizes_proxy_url_userinfo_for_logs() {
+        let sanitized = sanitize_proxy_url("http://user:secret@example.com:8080");
+
+        assert_eq!(sanitized, "http://redacted:redacted@example.com:8080/");
+        assert!(!sanitized.contains("user"));
+        assert!(!sanitized.contains("secret"));
+    }
+
+    #[test]
+    fn response_log_summary_excludes_body_values() {
+        let body = json!({
+            "error": "sensitive upstream details",
+            "checkout_session_id": "cs_secret"
+        });
+        let keys = response_body_keys(&body);
+
+        assert_eq!(response_body_kind(&body), "object");
+        assert!(keys.contains(&"error"));
+        assert!(keys.contains(&"checkout_session_id"));
+        assert!(!keys.contains(&"sensitive upstream details"));
+        assert!(!keys.contains(&"cs_secret"));
     }
 
     #[test]
