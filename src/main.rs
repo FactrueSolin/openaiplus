@@ -13,6 +13,7 @@ use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tower_http::services::ServeDir;
+use tracing::{error, info, warn};
 
 const CHATGPT_CHECKOUT_URL: &str = "https://chatgpt.com/backend-api/payments/checkout";
 
@@ -93,6 +94,11 @@ async fn main() -> Result<()> {
         .init();
 
     let config = AppConfig::load()?;
+    info!(
+        listen_addr = %config.listen_addr,
+        proxy_count = config.proxy_pool.len(),
+        "loaded application config"
+    );
     let state = AppState {
         checkout: ChatGptCheckoutClient::new(config.proxy_pool)?,
     };
@@ -106,7 +112,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
         .with_context(|| format!("failed to bind {}", config.listen_addr))?;
-    println!("listening on http://{}", config.listen_addr);
+    info!(listen_addr = %config.listen_addr, "server listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -130,6 +136,7 @@ async fn checkout(
     Json(request): Json<CheckoutRequest>,
 ) -> Result<Json<CheckoutResponse>, AppError> {
     if request.session_token.trim().is_empty() {
+        warn!("checkout rejected: missing session token");
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
             message: "session_token/accessToken is required".to_string(),
@@ -192,8 +199,23 @@ impl ChatGptCheckoutClient {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(CheckoutAttemptError::Send(err)) => last_send_error = Some(err),
-                Err(CheckoutAttemptError::Final(err)) => return Err(err),
+                Err(CheckoutAttemptError::Send(err)) => {
+                    warn!(
+                        proxy = %proxy_client.url,
+                        error = %err,
+                        "checkout proxy attempt failed"
+                    );
+                    last_send_error = Some(err);
+                }
+                Err(CheckoutAttemptError::Final(err)) => {
+                    error!(
+                        proxy = %proxy_client.url,
+                        status = %err.status,
+                        error = %err.message,
+                        "checkout proxy attempt returned terminal error"
+                    );
+                    return Err(err);
+                }
             }
         }
 
@@ -215,6 +237,7 @@ impl ChatGptCheckoutClient {
         session_token: &str,
         payload: &Value,
     ) -> Result<CheckoutResponse, CheckoutAttemptError> {
+        let upstream = used_proxy.as_deref().unwrap_or("direct");
         let response = client
             .post(CHATGPT_CHECKOUT_URL)
             .bearer_auth(session_token)
@@ -225,18 +248,35 @@ impl ChatGptCheckoutClient {
 
         let status = response.status();
         let body = response.json::<Value>().await.map_err(|err| {
+            error!(
+                upstream,
+                status = %status,
+                error = %err,
+                "failed to parse ChatGPT checkout response"
+            );
             CheckoutAttemptError::Final(AppError::bad_gateway(format!(
                 "invalid ChatGPT checkout response: {err}"
             )))
         })?;
 
         if !status.is_success() {
+            warn!(
+                upstream,
+                status = %status,
+                response = %body,
+                "ChatGPT checkout returned non-success status"
+            );
             return Err(CheckoutAttemptError::Final(AppError::bad_gateway(format!(
                 "ChatGPT checkout returned HTTP {status}: {body}"
             ))));
         }
 
         let checkout_url = extract_checkout_url(&body).ok_or_else(|| {
+            error!(
+                upstream,
+                response = %body,
+                "ChatGPT checkout response missing checkout url"
+            );
             CheckoutAttemptError::Final(AppError::bad_gateway(format!(
                 "missing checkout url in response: {body}"
             )))
