@@ -20,7 +20,7 @@ $env:PROXY_POOL = "http://127.0.0.1:7890,socks5h://127.0.0.1:1080"
 rtk cargo run
 ```
 
-Each `POST /api/checkout` request randomly selects one configured proxy. If `PROXY_POOL` is empty, the ChatGPT checkout request uses direct connection.
+Each `POST /api/checkout` request starts from a random configured proxy. If connecting or sending through that proxy fails, the server tries the remaining proxies once in order and then returns the last send error. ChatGPT HTTP errors and invalid response bodies are returned directly without switching proxies. If `PROXY_POOL` is empty, the ChatGPT checkout request uses direct connection.
 
 ## API
 
